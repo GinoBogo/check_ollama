@@ -1,8 +1,8 @@
 # check_ollama
 
-Checks that Ollama is installed and that its daemon is running, compares the local version against the latest stable GitHub release, and — when a newer release exists — offers to install it with the official installer.
+Checks that Ollama is installed and that its daemon is running, compares the local version against the latest stable GitHub release, and — when missing or outdated — offers to install or update it with the official Ollama installer.
 
-**Version:** 1.4 · **Author:** Gino Bogo · **License:** MIT
+**Version:** 1.5 · **Author:** Gino Bogo · **License:** MIT
 
 ## Contents
 
@@ -31,9 +31,9 @@ Checks that Ollama is installed and that its daemon is running, compares the loc
 2. Is the daemon reachable, and which version does it report?
 3. Is that version older than the latest **stable** release on GitHub?
 
-When the answer to (3) is yes, an interactive terminal run asks whether to update. Saying `y` downloads the official `install.sh`, runs it with `sudo`, and then verifies the result by polling the daemon — because the installer can exit non-zero in an optional post-install step after the new binary is already in place.
+When Ollama is missing, an interactive terminal run can install it using the official Ollama installer. When the answer to (3) is yes, it can update it the same way. The script downloads the official `install.sh`, runs it with `sudo`, and then verifies the result by polling the daemon — because the installer can exit non-zero in an optional post-install step after the new binary/service is already in place.
 
-The script is read-only until you confirm an update (or pass `-y`).
+The script is read-only until you confirm an install/update (or pass `-y`).
 
 ## Requirements
 
@@ -91,12 +91,12 @@ Options may be given in any order. `--` ends option parsing; unexpected argument
 | `-h` | `--help` | Show usage and exit 0 |
 | `-V` | `--version` | Print the script version and exit 0 |
 | `-q` | `--quiet` | Suppress the banner and `[INFO]`/`[NOTE]` lines |
-| `-y` | `--yes` | Update without asking for confirmation |
-| `-n` | `--no-update` | Never prompt or update; only report |
+| `-y` | `--yes` | Install or update without asking for confirmation |
+| `-n` | `--no-update` | Never prompt, install, or update; only report |
 
 If both `-y` and `-n` are given, the last one wins.
 
-`-q` still prints warnings and errors. After a successful update it also prints one verdict line, because state changed.
+`-q` still prints warnings and errors. After a successful install/update it also prints one verdict line, because state changed.
 
 ## Environment
 
@@ -115,33 +115,34 @@ The URL and timeout variables are mainly useful for mirrors and tests; they are 
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Installed and running, no newer release — or the update succeeded |
-| `1` | Ollama is not installed (no `ollama` on `PATH`) |
+| `0` | Installed and running, no newer release — or the install/update succeeded |
+| `1` | Ollama is not installed, and no install was performed (declined, `-n`, no terminal, or remote host) |
 | `2` | Installed but the daemon is not running (web check skipped) |
 | `3` | Version check failed: network error, HTTP error, rate limit, or malformed response |
 | `4` | A newer release exists but was not installed (declined, `-n`, no terminal, or remote daemon) |
-| `5` | An update was attempted but failed, or the daemon did not reach the expected version |
+| `5` | An install/update was attempted but failed, or the daemon did not reach the expected version |
 | `6` | Missing dependency or unsupported environment |
 
 ## How It Works
 
 1. **Preflight.** Verifies Bash 4+, required commands and `sort -V`. Missing tools cause exit `6`.
-2. **Installed?** `command -v ollama`. Missing → exit `1`.
+2. **Installed?** `command -v ollama`. Missing → offers the official installer (tty/`-y`), otherwise exits `1`. On successful install it continues with the normal checks.
 3. **Running?** `GET $OLLAMA_HOST/api/version`. If the API does not answer but `pgrep -x ollama` sees a process, the script warns and continues; if neither is true, exit `2` and skip the web check.
 4. **Local version.** Taken from the API response, falling back to `ollama --version`.
 5. **Latest release.** Fetched from the configured release endpoint. HTTP 200 must contain a `tag_name`; 403/429 are reported as rate limits with `Retry-After` when present. Pre-releases such as `v0.40.19-rc0` are ignored by the default GitHub `releases/latest` endpoint.
 
-Versions are compared with `sort -V`. Post-update verification accepts the expected version or any newer version, so a suffixed build such as `9.9.9+test` is not a false failure.
+Versions are compared with `sort -V`. Post-install/update verification accepts the expected version or any newer version, so a suffixed build such as `9.9.9+test` is not a false failure.
 
-## Update Flow
+## Install / Update Flow
 
-When a newer release is found:
+When Ollama is missing, or when a newer release is found:
 
-- **Interactive terminal:** prints the commands that will run, then prompts `Update now? [y/N]` on `/dev/tty` (default **No**). Accepts `y`, `Y`, `yes`, `YES`.
+- **Interactive terminal:** prints the commands that will run, then prompts on `/dev/tty` (default **No**). Accepts `y`, `Y`, `yes`, `YES`.
 - **`-y`:** skips the prompt.
-- **`-n`, no controlling terminal, or remote daemon:** reports and exits `4`. An unattended run never blocks.
+- **`-n` or no controlling terminal:** reports and exits `1` (missing install) or `4` (available update). An unattended run never blocks.
+- **Remote daemon:** the script refuses to install/update the local machine and exits `1`/`4` with an explanation.
 
-For remote `OLLAMA_HOST` values (anything other than `127.0.0.1`, `localhost`, `::1`, or a local Unix socket), the script refuses to install locally and tells you to run the update on the daemon host.
+The installer is the official Ollama install script (`OLLAMA_INSTALL_URL`, default `https://ollama.com/install.sh`, from the official Ollama distribution/GitHub project).
 
 On confirmation the script:
 
@@ -149,9 +150,9 @@ On confirmation the script:
 2. Downloads the installer to a `mktemp` file, removed on exit.
 3. Rejects empty downloads and HTML pages before execution. If `sha256sum` is available, it logs the installer digest.
 4. Runs the installer, capturing its exit status instead of aborting on it.
-5. Polls `/api/version` until `OLLAMA_UPDATE_TIMEOUT` for the expected version or newer.
-6. Succeeds (`0`) if the daemon reports the new version — even when the installer exited non-zero, with a warning naming that status.
-7. Fails (`5`) only when the daemon still does not report the expected version, and suggests the appropriate restart command.
+5. Polls `/api/version` until `OLLAMA_UPDATE_TIMEOUT` for the expected version or newer (or any version for a fresh install when release metadata is unavailable).
+6. Succeeds (`0`) if the daemon reports an acceptable version — even when the installer exited non-zero, with a warning naming that status.
+7. Fails (`5`) only when the daemon still does not report an acceptable version, and suggests the appropriate restart command.
 
 ## Safety
 
@@ -211,13 +212,13 @@ bash tests/test_check_ollama.sh -q       # failures + summary only
 bash tests/test_check_ollama.sh -v       # verbose
 ```
 
-The suite is hermetic: a small Python stub serves daemon and release endpoints (including 403/rate-limit and malformed responses, plus an optional Unix socket), while fake binaries, stub `sudo`, and stand-in installers are placed on `PATH`. It covers CLI parsing, dependency preflight, missing/not-running daemons, version comparison, rate limits, malformed responses, quiet mode, no-TTY behavior, interactive pty prompts, redirected-stdout prompting, remote-host refusal, Unix sockets, installer sanity checks, timeout handling, temp-file cleanup, and repository immutability.
+The suite is hermetic: a small Python stub serves daemon and release endpoints (including 403/rate-limit and malformed responses, plus an optional Unix socket), while fake binaries, stub `sudo`, and stand-in installers are placed on `PATH`. It covers CLI parsing, dependency preflight, missing-install flows, not-running daemons, version comparison, rate limits, malformed responses, quiet mode, no-TTY behavior, interactive pty prompts, redirected-stdout prompting, remote-host refusal, Unix sockets, installer sanity checks, timeout handling, temp-file cleanup, and repository immutability.
 
 `python3` is required for the stub server. Pty checks require `script` (util-linux) and are skipped when unavailable; Unix-socket checks are skipped when the platform cannot bind one.
 
 ## Disclaimer
 
-The update path runs the official Ollama installer with `sudo`. It downloads and executes code from the network, restarts the Ollama service, and may modify system packages (notably the GPU/CUDA step on Debian/Ubuntu). Review the installer first if you need to; use `-n` to keep the script strictly read-only. The software is provided "AS IS", without warranty of any kind, as stated in the LICENSE; the authors are not liable for data loss or any other damage resulting from its use.
+The install/update path runs the official Ollama installer with `sudo`. It downloads and executes code from the network, may install or restart the Ollama service, and may modify system packages (notably the GPU/CUDA step on Debian/Ubuntu). Review the installer first if you need to; use `-n` to keep the script strictly read-only. The software is provided "AS IS", without warranty of any kind, as stated in the LICENSE; the authors are not liable for data loss or any other damage resulting from its use.
 
 ## License
 

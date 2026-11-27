@@ -2,7 +2,7 @@
 # ==============================================================================
 # check_ollama.sh – Verify that Ollama is installed and running, compare the
 #                   local version against the latest upstream GitHub release,
-#                   and optionally update it with the official installer.
+#                   and optionally install or update it with the official installer.
 #
 # Author: Gino Bogo
 # Date: 2026-11-27
@@ -15,7 +15,7 @@ set -euo pipefail
 # GLOBAL CONFIGURATION
 # ==============================================================================
 
-SCRIPT_VERSION="1.4"
+SCRIPT_VERSION="1.5"
 
 # ANSI colour codes: only on a terminal, and never when NO_COLOR is set.
 if [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; then
@@ -99,7 +99,7 @@ HAVE_PGREP=false
 HAVE_SHA256=false
 TTY_AVAILABLE=false
 
-REQUIRED_COMMANDS=(curl sed grep sort head tail tr cut wc mktemp basename id)
+REQUIRED_COMMANDS=(curl sed grep sort head tail tr cut wc mktemp basename id rm sh)
 
 # ==============================================================================
 # USER INTERFACE
@@ -145,9 +145,9 @@ print_usage() {
     print_banner
     echo -e "${CYAN}Description:${RESET}"
     echo -e "  Checks that Ollama is installed and that its daemon is running. When"
-    echo -e "  the daemon answers, the local version is compared with the latest"
-    echo -e "  stable release published on GitHub. If a newer release exists, a"
-    echo -e "  terminal run offers to install it."
+    echo -e "  Ollama is missing, a terminal run can install it using the official"
+    echo -e "  installer. When the daemon answers, the local version is compared"
+    echo -e "  with the latest stable GitHub release and updates can be offered."
     echo
     echo -e "${CYAN}Usage:${RESET}"
     echo -e "  $script_name [options]"
@@ -156,8 +156,8 @@ print_usage() {
     echo -e "  ${GREEN}-h, --help${RESET}       Show this help message and exit"
     echo -e "  ${GREEN}-V, --version${RESET}    Show version and exit"
     echo -e "  ${GREEN}-q, --quiet${RESET}      Suppress the banner, INFO and NOTE lines"
-    echo -e "  ${GREEN}-y, --yes${RESET}        Update without asking for confirmation"
-    echo -e "  ${GREEN}-n, --no-update${RESET}  Never prompt or update, only report"
+    echo -e "  ${GREEN}-y, --yes${RESET}        Install or update without asking for confirmation"
+    echo -e "  ${GREEN}-n, --no-update${RESET}  Never prompt, install, or update; only report"
     echo
     echo -e "${CYAN}Environment:${RESET}"
     echo -e "  ${GREEN}OLLAMA_HOST${RESET}           Daemon address or Unix socket"
@@ -172,12 +172,12 @@ print_usage() {
     echo -e "  ${GREEN}NO_COLOR${RESET}              Disable ANSI colours"
     echo
     echo -e "${CYAN}Exit codes:${RESET}"
-    echo -e "  0  Installed and running, no newer release (or update succeeded)"
-    echo -e "  1  Ollama is not installed"
+    echo -e "  0  Installed and running, no newer release (or install/update succeeded)"
+    echo -e "  1  Ollama is not installed (or install was declined/not possible)"
     echo -e "  2  Ollama is installed but not running (web check skipped)"
     echo -e "  3  Version check failed (network, HTTP status or malformed response)"
     echo -e "  4  A newer release is available but was not installed"
-    echo -e "  5  Update was attempted but failed or needs a daemon restart"
+    echo -e "  5  Install/update was attempted but failed or needs a daemon restart"
     echo -e "  6  Missing dependency or unsupported environment"
     echo
     echo -e "${CYAN}Examples:${RESET}"
@@ -323,11 +323,14 @@ fetch_release() {
 
 # Function: run_update
 # Description: Downloads the installer, runs it with root privileges, then
-#              polls the daemon until it reports at least the expected version.
-# Arguments: $1 - version expected after the update
-# Returns: 0 when the daemon reports that version or newer, 1 otherwise
+#              polls the daemon until it reports the expected version (or any
+#              version when expected is empty, for a fresh install).
+# Arguments: $1 - expected version (empty means any daemon version)
+#            $2 - action label: install or update (default: update)
+# Returns: 0 when the daemon reports an acceptable version, 1 otherwise
 run_update() {
     local expected="$1"
+    local action="${2:-update}"
     local version=""
     local timeout="${OLLAMA_UPDATE_TIMEOUT:-20}"
     local installer_status=0
@@ -344,12 +347,12 @@ run_update() {
         if command -v sudo >/dev/null 2>&1; then
             runner=(sudo)
         else
-            log_err "Updating requires root privileges and 'sudo' is not available."
+            log_err "Installing/updating requires root privileges and 'sudo' is not available."
             return 1
         fi
     fi
 
-    log_note "Downloading the installer from $INSTALL_URL ..."
+    log_note "Downloading the official Ollama installer from $INSTALL_URL ..."
     if ! curl -fsSL --max-time 60 "$INSTALL_URL" -o "$TMP_INSTALLER"; then
         log_err "Failed to download the installer."
         return 1
@@ -379,17 +382,39 @@ run_update() {
     deadline=$((SECONDS + timeout))
     while ((SECONDS < deadline)); do
         version="$(api_version || true)"
-        version_ge "$version" "$expected" && break
+        if [ -n "$expected" ]; then
+            version_ge "$version" "$expected" && break
+        elif [ -n "$version" ]; then
+            break
+        fi
         sleep 1
     done
 
-    if version_ge "$version" "$expected"; then
+    if [ -n "$expected" ] && version_ge "$version" "$expected"; then
         if ((installer_status != 0)); then
             log_warn "Installer exited with status $installer_status (an optional post-install step failed); the daemon already reports v$version."
         fi
-        log_info "Update complete; the daemon now reports v$version."
+        if [ "$action" = "install" ]; then
+            log_info "Installation complete; the daemon now reports v$version."
+            if $QUIET; then
+                printf '%bInstalled Ollama v%s.%b\n' "$GREEN" "$version" "$RESET"
+            fi
+        else
+            log_info "Update complete; the daemon now reports v$version."
+            if $QUIET; then
+                printf '%bUpdated Ollama to v%s.%b\n' "$GREEN" "$version" "$RESET"
+            fi
+        fi
+        return 0
+    fi
+
+    if [ -z "$expected" ] && [ -n "$version" ]; then
+        if ((installer_status != 0)); then
+            log_warn "Installer exited with status $installer_status (an optional post-install step failed); the daemon already reports v$version."
+        fi
+        log_info "Installation complete; the daemon now reports v$version."
         if $QUIET; then
-            printf '%bUpdated Ollama to v%s.%b\n' "$GREEN" "$version" "$RESET"
+            printf '%bInstalled Ollama v%s.%b\n' "$GREEN" "$version" "$RESET"
         fi
         return 0
     fi
@@ -405,6 +430,13 @@ run_update() {
         log_note "Restart the Ollama service (for example, restart 'ollama serve')."
     fi
     return 1
+}
+
+ensure_tmp_installer() {
+    if [ -z "$TMP_INSTALLER" ]; then
+        TMP_INSTALLER="$(mktemp)"
+        trap 'rm -f "${TMP_INSTALLER:-}"' EXIT
+    fi
 }
 
 # ==============================================================================
@@ -471,7 +503,60 @@ log_info "Phase 1/4: checking whether Ollama is installed ..."
 OLLAMA_BIN="$(command -v ollama || true)"
 if [ -z "$OLLAMA_BIN" ]; then
     log_err "Ollama is not installed (no 'ollama' executable on PATH)."
-    exit 1
+    log_note "Official installer: $INSTALL_URL"
+    log_note "GitHub repository: https://github.com/ollama/ollama"
+
+    if [ "$UPDATE_MODE" = "no" ]; then
+        log_note "Install skipped (-n/--no-update)."
+        exit 1
+    fi
+    if ! $DAEMON_IS_LOCAL; then
+        log_warn "OLLAMA_HOST points to a remote daemon ($DAEMON_HOST); refusing to install Ollama on this machine."
+        log_note "Run the install on the host that should run Ollama."
+        exit 1
+    fi
+    if [ "$UPDATE_MODE" = "ask" ]; then
+        if ! $TTY_AVAILABLE; then
+            log_note "No terminal available; use -y to install automatically."
+            exit 1
+        fi
+        if ! $QUIET; then
+            printf '%b[NOTE]%b Install command:\n' "$CYAN" "$RESET" >&3
+            printf '       curl -fsSL %s -o <temp file>\n' "$INSTALL_URL" >&3
+            printf '       sudo sh <temp file>\n' >&3
+        fi
+        printf 'Install Ollama now using the official installer? [y/N] ' >&3
+        REPLY=""
+        read -r REPLY </dev/tty || true
+        REPLY="$(printf '%s' "$REPLY" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+        case "$REPLY" in
+            y | yes) ;;
+            *)
+                log_note "Install skipped."
+                exit 1
+                ;;
+        esac
+    fi
+
+    ensure_tmp_installer
+    INSTALL_EXPECTED=""
+    if fetch_release; then
+        INSTALL_EXPECTED="$LATEST_VERSION"
+    else
+        log_warn "Could not determine the latest release; the installer will be verified by daemon startup only."
+    fi
+
+    if ! run_update "$INSTALL_EXPECTED" install; then
+        exit 5
+    fi
+
+    hash -r 2>/dev/null || true
+    OLLAMA_BIN="$(command -v ollama || true)"
+    if [ -z "$OLLAMA_BIN" ]; then
+        log_err "Installer completed but 'ollama' is still not on PATH."
+        log_note "Open a new shell or check /usr/local/bin/ollama."
+        exit 5
+    fi
 fi
 log_info "Ollama found at $OLLAMA_BIN"
 
@@ -582,10 +667,9 @@ if [ "$UPDATE_MODE" = "ask" ]; then
     esac
 fi
 
-TMP_INSTALLER="$(mktemp)"
-trap 'rm -f "${TMP_INSTALLER:-}"' EXIT
+ensure_tmp_installer
 
-if run_update "$LATEST_VERSION"; then
+if run_update "$LATEST_VERSION" update; then
     exit 0
 fi
 exit 5

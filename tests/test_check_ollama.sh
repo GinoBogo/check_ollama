@@ -16,7 +16,7 @@
 #
 # Author: Gino Bogo
 # Date: 2026-11
-# Version: 1.4
+# Version: 1.5
 # ==============================================================================
 
 set -uo pipefail
@@ -325,6 +325,21 @@ cat >"$WORKDIR/install_html.sh" <<'EOF'
 EOF
 chmod +x "$WORKDIR"/install_*.sh
 
+INSTALLBIN="$WORKDIR/installbin"
+mkdir -p "$INSTALLBIN"
+cat >"$WORKDIR/install_fresh.sh" <<EOF
+#!/bin/sh
+cat > '$INSTALLBIN/ollama' <<'SCRIPT'
+#!/bin/sh
+echo "ollama version is \${FAKE_OLLAMA_VERSION:-9.9.9}"
+SCRIPT
+chmod +x '$INSTALLBIN/ollama'
+printf '9.9.9\n' > '$WORKDIR/api_version'
+echo 'fake fresh install complete'
+exit 0
+EOF
+chmod +x "$WORKDIR/install_fresh.sh"
+
 PTY=false
 command -v script >/dev/null 2>&1 && PTY=true
 SETSID=false
@@ -337,7 +352,7 @@ make_path() {
     local dir="$1" c omit skip
     shift
     mkdir -p "$dir"
-    for c in curl sed grep sort head tail tr cut wc mktemp basename id ollama; do
+    for c in curl sed grep sort head tail tr cut wc mktemp basename id rm sh cat chmod printf ollama; do
         skip=false
         for omit in "$@"; do
             if [ "$c" = "$omit" ]; then skip=true; fi
@@ -353,6 +368,7 @@ make_path() {
 
 NOOLLAMA="$WORKDIR/noollama"
 make_path "$NOOLLAMA" ollama
+ln -sf "$BIN/sudo" "$NOOLLAMA/sudo"
 
 NOCURL="$WORKDIR/nocurl"
 make_path "$NOCURL" curl
@@ -375,7 +391,7 @@ section "CLI surface"
 # ==============================================================================
 
 ran_code "-V exits 0" 0 "$BASH" "$RUNNER" -V
-says "-V prints the script version" "check_ollama.sh v1.4"
+says "-V prints the script version" "check_ollama.sh v1.5"
 
 ran_code "-h exits 0" 0 "$BASH" "$RUNNER" -h
 says "-h prints usage" "Usage:"
@@ -405,8 +421,63 @@ says "the broken parser is reported" "does not work"
 section "not installed"
 # ==============================================================================
 
-ran_code "no ollama on PATH exits 1" 1 env PATH="$NOOLLAMA" "$BASH" "$SUT"
+ran_code "no ollama on PATH with -n exits 1" 1 env PATH="$NOOLLAMA" "$BASH" "$SUT" -n
 says "the missing install is reported" "Ollama is not installed"
+says "the official installer is mentioned" "Official installer:"
+says "-n skips install" "Install skipped (-n/--no-update)"
+
+if $SETSID; then
+    ran_code "no ollama on PATH with no terminal exits 1" 1 \
+        env PATH="$NOOLLAMA" "$(command -v setsid)" -w "$BASH" "$SUT"
+    says "no terminal install hint is shown" "No terminal available; use -y to install automatically"
+else
+    SKIPPED=$((SKIPPED + 2))
+    note "    (setsid not usable: no-terminal install check skipped)"
+fi
+
+ran_code "remote host refuses local install" 1 \
+    env PATH="$NOOLLAMA" OLLAMA_HOST="10.0.0.5:11434" "$BASH" "$SUT" -y
+says "remote install refusal is explained" "refusing to install Ollama on this machine"
+
+set_versions 9.9.9 9.9.9
+ran_code "fresh install with -y succeeds" 0 \
+    env PATH="$INSTALLBIN:$NOOLLAMA" OLLAMA_HOST="$API_BASE" \
+        OLLAMA_RELEASES_API="$RELEASES_URL" \
+        OLLAMA_INSTALL_URL="file://$WORKDIR/install_fresh.sh" \
+        "$BASH" "$SUT" -y
+says "fresh install completes" "Installation complete; the daemon now reports v9.9.9"
+says "post-install check runs" "Ollama is up to date (v9.9.9)"
+rm -f "$INSTALLBIN/ollama"
+
+set_versions 0.0.1 9.9.9
+ran_code "fresh install failure exits 5" 5 \
+    env PATH="$INSTALLBIN:$NOOLLAMA" OLLAMA_HOST="$API_BASE" \
+        OLLAMA_RELEASES_API="$RELEASES_URL" \
+        OLLAMA_INSTALL_URL="file://$WORKDIR/install_fail.sh" \
+        "$BASH" "$SUT" -y
+says "fresh install failure is reported" "Installer exited with status 1"
+
+if $PTY; then
+    set_versions 9.9.9 9.9.9
+    # Ensure no leftover ollama in INSTALLBIN from previous test? install_fresh creates it; install_fail did not.
+    rm -f "$INSTALLBIN/ollama"
+    run_pty y 0 "accepting install prompt succeeds" \
+        env PATH="$INSTALLBIN:$NOOLLAMA" OLLAMA_HOST="$API_BASE" \
+            OLLAMA_RELEASES_API="$RELEASES_URL" \
+            OLLAMA_INSTALL_URL="file://$WORKDIR/install_fresh.sh" \
+            "$BASH" "$SUT"
+    says "install prompt is shown" "Install Ollama now using the official installer? [y/N]"
+    rm -f "$INSTALLBIN/ollama"
+    set_versions 9.9.9 9.9.9
+    run_pty n 1 "declining install prompt exits 1" \
+        env PATH="$INSTALLBIN:$NOOLLAMA" OLLAMA_HOST="$API_BASE" \
+            OLLAMA_RELEASES_API="$RELEASES_URL" \
+            "$BASH" "$SUT"
+    says "install decline is reported" "Install skipped."
+else
+    SKIPPED=$((SKIPPED + 4))
+    note "    (script(1) not found: install prompt checks skipped)"
+fi
 
 # ==============================================================================
 section "daemon not running"
