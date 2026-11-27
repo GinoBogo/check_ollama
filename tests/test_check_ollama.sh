@@ -76,8 +76,7 @@ trap cleanup EXIT
 
 OUT="$WORKDIR/output"
 BIN="$WORKDIR/bin"
-STATE="$WORKDIR/state"
-mkdir -p "$BIN" "$STATE" "$WORKDIR/tmp"
+mkdir -p "$BIN" "$WORKDIR/tmp"
 
 PASSED=0
 FAILED=0
@@ -243,8 +242,8 @@ RELEASES_URL="http://$API_BASE/releases"
 
 # set_versions <daemon-version> <latest-release>
 set_versions() {
-    printf '%s\n' "$1" >"$STATE/api_version"
-    printf '%s\n' "$2" >"$STATE/latest"
+    printf '%s\n' "$1" >"$WORKDIR/api_version"
+    printf '%s\n' "$2" >"$WORKDIR/latest"
 }
 
 # Wrapper so every run gets the stub environment without repeating it.
@@ -253,7 +252,9 @@ RUNNER="$WORKDIR/run_sut.sh"
     echo '#!/usr/bin/env bash'
     echo "export OLLAMA_HOST='$API_BASE'"
     echo "export OLLAMA_RELEASES_API='$RELEASES_URL'"
-    echo "export PATH='$BIN:$PATH'"
+    echo 'export PATH='"'$BIN:$PATH'"
+    echo '# Default to a harmless stand-in: no test may reach the real installer.'
+    echo '[[ -n "${OLLAMA_INSTALL_URL:-}" ]] || export OLLAMA_INSTALL_URL="file://'"$WORKDIR"'/install_fail.sh"'
     echo '[[ -n "${OLLAMA_INSTALL_URL:-}" ]] && export OLLAMA_INSTALL_URL'
     echo '[[ -n "${TMPDIR:-}" ]] && export TMPDIR'
     echo "exec '$BASH' '$SUT' \"\$@\""
@@ -265,13 +266,13 @@ chmod +x "$RUNNER"
 # "fail" changes nothing.
 cat >"$WORKDIR/install_ok.sh" <<EOF
 #!/bin/sh
-printf '9.9.9\n' > '$STATE/api_version'
+printf '9.9.9\n' > '$WORKDIR/api_version'
 echo 'fake install complete'
 exit 0
 EOF
 cat >"$WORKDIR/install_buggy.sh" <<EOF
 #!/bin/sh
-printf '9.9.9\n' > '$STATE/api_version'
+printf '9.9.9\n' > '$WORKDIR/api_version'
 echo 'fake install complete, optional step failed'
 exit 3
 EOF
@@ -386,14 +387,14 @@ if $PTY; then
 
     set_versions 0.0.1 9.9.9
     run_pty y 0 "accepting the prompt updates" \
-        env OLLAMA_INSTALL_URL="$WORKDIR/install_ok.sh" "$BASH" "$RUNNER"
+        env OLLAMA_INSTALL_URL="file://$WORKDIR/install_ok.sh" "$BASH" "$RUNNER"
     says "the update is confirmed" "Update complete; the daemon now reports v9.9.9"
     says "the summary names the new version" "Ollama updated to v9.9.9"
     says_not "a clean installer produces no warning" "Installer exited with status"
 
     set_versions 0.0.1 9.9.9
     run_pty y 0 "a late installer failure still counts as success" \
-        env OLLAMA_INSTALL_URL="$WORKDIR/install_buggy.sh" "$BASH" "$RUNNER"
+        env OLLAMA_INSTALL_URL="file://$WORKDIR/install_buggy.sh" "$BASH" "$RUNNER"
     says "the installer status is surfaced" "Installer exited with status 3"
     says "the daemon version wins" "Update complete; the daemon now reports v9.9.9"
 else
@@ -407,11 +408,12 @@ section "installer failures"
 
 set_versions 0.0.1 9.9.9
 ran_code "an installer that changes nothing exits 5" 5 \
-    env OLLAMA_INSTALL_URL="$WORKDIR/install_fail.sh" "$BASH" "$RUNNER" -y
+    env OLLAMA_INSTALL_URL="file://$WORKDIR/install_fail.sh" "$BASH" "$RUNNER" -y
 says "the failure names the exit status" "Installer exited with status 1"
 says "the unchanged daemon is reported" "still reports '0.0.1'"
 
-ran_code "-y with nothing to do exits 0" 0 env "$BASH" "$RUNNER" -y
+set_versions 1.2.3 1.2.3
+ran_code "-y with nothing to do exits 0" 0 "$BASH" "$RUNNER" -y
 says_not "no installer is downloaded when current" "Downloading the installer"
 
 # ==============================================================================
@@ -422,7 +424,7 @@ TT="$WORKDIR/tmpdir"
 mkdir -p "$TT"
 set_versions 0.0.1 9.9.9
 ran_code "an update run exits 0" 0 \
-    env TMPDIR="$TT" OLLAMA_INSTALL_URL="$WORKDIR/install_buggy.sh" "$BASH" "$RUNNER" -y
+    env TMPDIR="$TT" OLLAMA_INSTALL_URL="file://$WORKDIR/install_buggy.sh" "$BASH" "$RUNNER" -y
 cond "TMPDIR is empty after the run" test -z "$(ls -A "$TT")"
 
 # ==============================================================================
