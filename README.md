@@ -2,7 +2,7 @@
 
 Checks that Ollama is installed and that its daemon is running, compares the local version against the latest stable GitHub release, and — when a newer release exists — offers to install it with the official installer.
 
-**Version:** 1.3 · **Author:** Gino Bogo · **License:** MIT
+**Version:** 1.4 · **Author:** Gino Bogo · **License:** MIT
 
 ## Contents
 
@@ -16,6 +16,7 @@ Checks that Ollama is installed and that its daemon is running, compares the loc
 - [Exit Codes](#exit-codes)
 - [How It Works](#how-it-works)
 - [Update Flow](#update-flow)
+- [Safety](#safety)
 - [Examples](#examples)
 - [Behavioral Notes](#behavioral-notes)
 - [Testing](#testing)
@@ -30,17 +31,20 @@ Checks that Ollama is installed and that its daemon is running, compares the loc
 2. Is the daemon reachable, and which version does it report?
 3. Is that version older than the latest **stable** release on GitHub?
 
-When the answer to (3) is yes and the script is attached to a terminal, it asks whether to update. Saying `y` downloads the official `install.sh`, runs it with `sudo`, and then verifies the result by polling the daemon — because the installer can exit non-zero in an optional post-install step after the new binary is already in place.
+When the answer to (3) is yes, an interactive terminal run asks whether to update. Saying `y` downloads the official `install.sh`, runs it with `sudo`, and then verifies the result by polling the daemon — because the installer can exit non-zero in an optional post-install step after the new binary is already in place.
 
 The script is read-only until you confirm an update (or pass `-y`).
 
 ## Requirements
 
-- **Bash 4.0+** (uses arrays; checked implicitly by the syntax used).
-- **curl** for the daemon API, the GitHub release metadata and the installer.
-- Standard userland: `sed`, `grep`, `sort`, `head`, `mktemp`, `pgrep`.
+- **Bash 4.0+**. The script checks this at startup and exits `6` if unsupported.
+- **curl** for the daemon API, release metadata and the installer.
+- **sort -V** for version comparison. The script probes this at startup.
+- Standard userland: `sed`, `grep`, `head`, `tail`, `tr`, `cut`, `wc`, `mktemp`, `basename`, `id`.
+- Optional: `pgrep` (process fallback when the API is unreachable), `sha256sum` (prints the installer digest before execution).
 - For updating: `sudo` when not already running as root.
-- `sort -V` must be available (GNU coreutils, BusyBox, or BSD `sort` with version sort).
+
+Missing required commands or an unsupported `sort -V` are reported explicitly and cause exit `6`.
 
 Tested on Linux (Manjaro/Arch-family). The update path also works on Debian/Ubuntu, where the installer's optional CUDA step is fully supported.
 
@@ -69,6 +73,7 @@ Companion files:
 check_ollama.sh             # check, and ask before updating
 check_ollama.sh -n          # check only, never prompt
 check_ollama.sh -q -n       # cron-friendly: warnings and errors only
+check_ollama.sh -y          # unattended update
 ```
 
 ## Usage
@@ -77,7 +82,7 @@ check_ollama.sh -q -n       # cron-friendly: warnings and errors only
 check_ollama.sh [options]
 ```
 
-Options may be given in any order. `--` ends option parsing.
+Options may be given in any order. `--` ends option parsing; unexpected arguments after `--` are rejected.
 
 ## Options
 
@@ -85,21 +90,26 @@ Options may be given in any order. `--` ends option parsing.
 | --- | --- | --- |
 | `-h` | `--help` | Show usage and exit 0 |
 | `-V` | `--version` | Print the script version and exit 0 |
-| `-q` | `--quiet` | Suppress the banner and all `[INFO]`/`[NOTE]` lines |
+| `-q` | `--quiet` | Suppress the banner and `[INFO]`/`[NOTE]` lines |
 | `-y` | `--yes` | Update without asking for confirmation |
 | `-n` | `--no-update` | Never prompt or update; only report |
 
 If both `-y` and `-n` are given, the last one wins.
 
+`-q` still prints warnings and errors. After a successful update it also prints one verdict line, because state changed.
+
 ## Environment
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `OLLAMA_HOST` | `127.0.0.1:11434` | Daemon address; `host:port` or a full URL |
+| `OLLAMA_HOST` | `127.0.0.1:11434` | Daemon address: `host:port`, full URL, `unix:///path`, or an absolute socket path |
 | `OLLAMA_INSTALL_URL` | `https://ollama.com/install.sh` | Installer downloaded and run on update |
 | `OLLAMA_RELEASES_API` | GitHub `releases/latest` | Release metadata endpoint (JSON with `tag_name`) |
+| `OLLAMA_RELEASES_PAGE` | GitHub release page, or the API URL when `OLLAMA_RELEASES_API` is overridden | Human-readable release page shown to the user |
+| `OLLAMA_UPDATE_TIMEOUT` | `20` | Seconds to wait for the daemon to report the new version after an update |
+| `NO_COLOR` | unset | Disable ANSI colours when set to any non-empty value |
 
-The two URL variables exist so the update and version-check flows can be exercised with stand-ins; they are not needed in normal use.
+The URL and timeout variables are mainly useful for mirrors and tests; they are not needed in normal use.
 
 ## Exit Codes
 
@@ -108,36 +118,49 @@ The two URL variables exist so the update and version-check flows can be exercis
 | `0` | Installed and running, no newer release — or the update succeeded |
 | `1` | Ollama is not installed (no `ollama` on `PATH`) |
 | `2` | Installed but the daemon is not running (web check skipped) |
-| `3` | Version check failed: GitHub unreachable, or the response could not be parsed |
-| `4` | A newer release exists but was not installed (declined, `-n`, or no terminal) |
-| `5` | An update was attempted but failed, or the daemon did not reach the new version |
+| `3` | Version check failed: network error, HTTP error, rate limit, or malformed response |
+| `4` | A newer release exists but was not installed (declined, `-n`, no terminal, or remote daemon) |
+| `5` | An update was attempted but failed, or the daemon did not reach the expected version |
+| `6` | Missing dependency or unsupported environment |
 
 ## How It Works
 
-1. **Installed?** `command -v ollama`. Missing → exit `1`, nothing else runs.
-2. **Running?** `GET $OLLAMA_HOST/api/version`. If the API does not answer but an `ollama` process exists, the script warns and continues; if neither is true, exit `2` and skip the web check.
-3. **Local version.** Taken from the API response, falling back to `ollama --version`.
-4. **Latest release.** Parsed from `tag_name` of the latest stable GitHub release (`v` prefix stripped). Pre-releases such as `v0.40.19-rc0` are deliberately ignored because `releases/latest` excludes them.
+1. **Preflight.** Verifies Bash 4+, required commands and `sort -V`. Missing tools cause exit `6`.
+2. **Installed?** `command -v ollama`. Missing → exit `1`.
+3. **Running?** `GET $OLLAMA_HOST/api/version`. If the API does not answer but `pgrep -x ollama` sees a process, the script warns and continues; if neither is true, exit `2` and skip the web check.
+4. **Local version.** Taken from the API response, falling back to `ollama --version`.
+5. **Latest release.** Fetched from the configured release endpoint. HTTP 200 must contain a `tag_name`; 403/429 are reported as rate limits with `Retry-After` when present. Pre-releases such as `v0.40.19-rc0` are ignored by the default GitHub `releases/latest` endpoint.
 
-Versions are compared with `sort -V`, so `0.40.9` sorts before `0.40.18`. If the local version is newer than the latest release, the script says so and exits `0`.
+Versions are compared with `sort -V`. Post-update verification accepts the expected version or any newer version, so a suffixed build such as `9.9.9+test` is not a false failure.
 
 ## Update Flow
 
 When a newer release is found:
 
-- **Interactive terminal:** prints the two commands that will run, then `Update now? [y/N]` (default **No**).
+- **Interactive terminal:** prints the commands that will run, then prompts `Update now? [y/N]` on `/dev/tty` (default **No**). Accepts `y`, `Y`, `yes`, `YES`.
 - **`-y`:** skips the prompt.
-- **`-n`, or no terminal** (cron, pipe, CI): reports and exits `4` — an unattended run never blocks.
+- **`-n`, no controlling terminal, or remote daemon:** reports and exits `4`. An unattended run never blocks.
+
+For remote `OLLAMA_HOST` values (anything other than `127.0.0.1`, `localhost`, `::1`, or a local Unix socket), the script refuses to install locally and tells you to run the update on the daemon host.
 
 On confirmation the script:
 
-1. Detects whether it must use `sudo` (skipped when already root) and downloads the installer to a `mktemp` file, removed on exit.
-2. Runs the installer, capturing its exit status instead of aborting on it.
-3. Polls `/api/version` for up to five seconds for the expected version.
-4. Succeeds (`0`) if the daemon reports the new version — even when the installer exited non-zero, with a warning naming that status.
-5. Fails (`5`) only when the daemon still reports a different version, and suggests restarting the service.
+1. Detects whether it must use `sudo` (skipped when already root).
+2. Downloads the installer to a `mktemp` file, removed on exit.
+3. Rejects empty downloads and HTML pages before execution. If `sha256sum` is available, it logs the installer digest.
+4. Runs the installer, capturing its exit status instead of aborting on it.
+5. Polls `/api/version` until `OLLAMA_UPDATE_TIMEOUT` for the expected version or newer.
+6. Succeeds (`0`) if the daemon reports the new version — even when the installer exited non-zero, with a warning naming that status.
+7. Fails (`5`) only when the daemon still does not report the expected version, and suggests the appropriate restart command.
 
-That last rule matters on Arch-family systems: the official installer's optional GPU/CUDA block runs `OS_VERSION=$VERSION_ID` under `set -eu`, but such distributions have no `VERSION_ID` in `/etc/os-release`. The installer therefore aborts **after** installing the binary and (re)starting the service. The daemon check reports the upgrade correctly where the installer's exit code would not.
+## Safety
+
+- The prompt is written to `/dev/tty`, so redirecting stdout (for example `check_ollama.sh > log`) cannot hide it. Without a controlling terminal, the script reports and exits `4`.
+- The installer is downloaded to a temp file and executed — never piped into a root shell.
+- Empty and HTML responses are rejected before execution; the SHA-256 digest is logged when `sha256sum` is present.
+- Remote daemons are never updated from the local machine by this script.
+- Unix sockets are supported via `curl --unix-socket`.
+- Updating restarts the Ollama service; running models are unloaded.
 
 ## Examples
 
@@ -153,25 +176,30 @@ Report only, suitable for a timer or CI job:
 check_ollama.sh -q -n
 ```
 
-Update unattended, even though there is no terminal:
+Update unattended:
 
 ```sh
 check_ollama.sh -y
 ```
 
-Check a remote daemon:
+Check a remote daemon (report only):
 
 ```sh
 OLLAMA_HOST=10.0.0.5:11434 check_ollama.sh -n
 ```
 
+Check a Unix-socket daemon:
+
+```sh
+OLLAMA_HOST=unix:///var/run/ollama.sock check_ollama.sh -n
+```
+
 ## Behavioral Notes
 
-- The banner and `[INFO]`/`[NOTE]` lines are colourised; `[WARN]`, `[FAIL]` and the update prompt are always printed, even with `-q`.
-- Colours are emitted unconditionally (no TTY detection), matching the sibling `replace_files` project's style.
-- The installer is downloaded to a temp file and executed — never piped into a root shell.
-- Updating restarts the Ollama service; running models are unloaded.
-- The script performs no cleanup of models or configuration.
+- Colours are emitted only when stdout is a TTY and `NO_COLOR` is not set.
+- Warnings and errors are always printed, even with `-q`.
+- The GitHub release check uses unauthenticated requests by default; a 403/429 is reported clearly, and `OLLAMA_RELEASES_API` can point at a mirror.
+- The official installer can exit non-zero in an optional post-install step after the binary is already installed. The daemon version is the source of truth.
 
 ## Testing
 
@@ -183,9 +211,9 @@ bash tests/test_check_ollama.sh -q       # failures + summary only
 bash tests/test_check_ollama.sh -v       # verbose
 ```
 
-The suite is hermetic: a small Python stub serves the daemon API and the release metadata, while a fake `ollama` binary, a stub `sudo`, a failing `pgrep` and a stand-in installer are placed on `PATH`. It covers the CLI surface, not-installed and not-running paths, up-to-date and update-available reporting, quiet mode, interactive accept/decline through a pty (skipped when `script` is unavailable), installer failures with and without a successful upgrade, temp-file cleanup, and repository immutability.
+The suite is hermetic: a small Python stub serves daemon and release endpoints (including 403/rate-limit and malformed responses, plus an optional Unix socket), while fake binaries, stub `sudo`, and stand-in installers are placed on `PATH`. It covers CLI parsing, dependency preflight, missing/not-running daemons, version comparison, rate limits, malformed responses, quiet mode, no-TTY behavior, interactive pty prompts, redirected-stdout prompting, remote-host refusal, Unix sockets, installer sanity checks, timeout handling, temp-file cleanup, and repository immutability.
 
-`python3` is required for the stub server; the pty checks require `script` from util-linux.
+`python3` is required for the stub server. Pty checks require `script` (util-linux) and are skipped when unavailable; Unix-socket checks are skipped when the platform cannot bind one.
 
 ## Disclaimer
 
