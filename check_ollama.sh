@@ -15,31 +15,75 @@ set -euo pipefail
 # GLOBAL CONFIGURATION
 # ==============================================================================
 
-SCRIPT_VERSION="1.3"
+SCRIPT_VERSION="1.4"
 
-# ANSI colour codes
-RED=$'\033[0;31m'
-GREEN=$'\033[0;32m'
-YELLOW=$'\033[0;33m'
-CYAN=$'\033[0;36m'
-BOLD=$'\033[1m'
-RESET=$'\033[0m'
+# ANSI colour codes: only on a terminal, and never when NO_COLOR is set.
+if [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; then
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[0;33m'
+    CYAN=$'\033[0;36m'
+    BOLD=$'\033[1m'
+    RESET=$'\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    CYAN=''
+    BOLD=''
+    RESET=''
+fi
 SEPARATOR="----------------------------------------------------------------------"
 
-# Daemon endpoint. OLLAMA_HOST may be given as "host:port" (Ollama's own
-# convention) or as a full URL; a scheme is added when it is missing.
+# Daemon endpoint. OLLAMA_HOST may be "host:port", a full URL, or a Unix socket
+# ("unix:///path" or an absolute path).
 OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
-case "$OLLAMA_HOST" in
-    http://* | https://*) OLLAMA_URL="$OLLAMA_HOST" ;;
-    *) OLLAMA_URL="http://$OLLAMA_HOST" ;;
-esac
-OLLAMA_URL="${OLLAMA_URL%/}"
-API_VERSION_URL="$OLLAMA_URL/api/version"
+CURL_DAEMON=()
+DAEMON_HOST=""
+DAEMON_IS_LOCAL=false
+UNIX_SOCKET=""
 
-# Upstream release metadata (no jq dependency: plain grep/sed parsing). The
-# endpoint is overridable so the regression suite can run without a network.
+case "$OLLAMA_HOST" in
+    unix://*) UNIX_SOCKET="${OLLAMA_HOST#unix://}" ;;
+    /*) UNIX_SOCKET="$OLLAMA_HOST" ;;
+esac
+
+if [ -n "$UNIX_SOCKET" ]; then
+    CURL_DAEMON=(--unix-socket "$UNIX_SOCKET")
+    OLLAMA_URL="unix:$UNIX_SOCKET"
+    API_VERSION_URL="http://localhost/api/version"
+    DAEMON_HOST="$UNIX_SOCKET"
+    DAEMON_IS_LOCAL=true
+else
+    case "$OLLAMA_HOST" in
+        http://* | https://*) OLLAMA_URL="$OLLAMA_HOST" ;;
+        *) OLLAMA_URL="http://$OLLAMA_HOST" ;;
+    esac
+    OLLAMA_URL="${OLLAMA_URL%/}"
+    API_VERSION_URL="$OLLAMA_URL/api/version"
+    REST="${OLLAMA_URL#*://}"
+    REST="${REST%%/*}"
+    if [[ "$REST" =~ ^\[([0-9A-Fa-f:]+)\](:([0-9]+))?$ ]]; then
+        DAEMON_HOST="${BASH_REMATCH[1]}"
+    elif [[ "$REST" =~ ^([^:]+):([0-9]+)$ ]]; then
+        DAEMON_HOST="${BASH_REMATCH[1]}"
+    else
+        DAEMON_HOST="$REST"
+    fi
+    case "$DAEMON_HOST" in
+        127.0.0.1 | localhost | ::1) DAEMON_IS_LOCAL=true ;;
+    esac
+fi
+
+# Upstream release metadata. Both endpoints are overridable for mirrors/tests.
 RELEASES_API="${OLLAMA_RELEASES_API:-https://api.github.com/repos/ollama/ollama/releases/latest}"
-RELEASES_PAGE="https://github.com/ollama/ollama/releases/latest"
+if [ -n "${OLLAMA_RELEASES_PAGE:-}" ]; then
+    RELEASES_PAGE="$OLLAMA_RELEASES_PAGE"
+elif [ -n "${OLLAMA_RELEASES_API:-}" ]; then
+    RELEASES_PAGE="$RELEASES_API"
+else
+    RELEASES_PAGE="https://github.com/ollama/ollama/releases/latest"
+fi
 
 # Official installer. The URL is overridable so the update flow can be tested
 # with a stand-in script without touching a real Ollama installation.
@@ -49,6 +93,13 @@ INSTALL_URL="${OLLAMA_INSTALL_URL:-https://ollama.com/install.sh}"
 QUIET=false
 UPDATE_MODE="ask" # ask | yes | no
 TMP_INSTALLER=""
+
+# Capability flags, resolved by check_environment().
+HAVE_PGREP=false
+HAVE_SHA256=false
+TTY_AVAILABLE=false
+
+REQUIRED_COMMANDS=(curl sed grep sort head tail tr cut wc mktemp basename id)
 
 # ==============================================================================
 # USER INTERFACE
@@ -95,8 +146,8 @@ print_usage() {
     echo -e "${CYAN}Description:${RESET}"
     echo -e "  Checks that Ollama is installed and that its daemon is running. When"
     echo -e "  the daemon answers, the local version is compared with the latest"
-    echo -e "  stable release published on GitHub. If a newer release exists and the"
-    echo -e "  script runs in a terminal, it offers to install it."
+    echo -e "  stable release published on GitHub. If a newer release exists, a"
+    echo -e "  terminal run offers to install it."
     echo
     echo -e "${CYAN}Usage:${RESET}"
     echo -e "  $script_name [options]"
@@ -104,24 +155,30 @@ print_usage() {
     echo -e "${CYAN}Options:${RESET}"
     echo -e "  ${GREEN}-h, --help${RESET}       Show this help message and exit"
     echo -e "  ${GREEN}-V, --version${RESET}    Show version and exit"
-    echo -e "  ${GREEN}-q, --quiet${RESET}      Suppress the banner and informational lines"
+    echo -e "  ${GREEN}-q, --quiet${RESET}      Suppress the banner, INFO and NOTE lines"
     echo -e "  ${GREEN}-y, --yes${RESET}        Update without asking for confirmation"
     echo -e "  ${GREEN}-n, --no-update${RESET}  Never prompt or update, only report"
     echo
     echo -e "${CYAN}Environment:${RESET}"
-    echo -e "  ${GREEN}OLLAMA_HOST${RESET}          Daemon address (default: 127.0.0.1:11434)"
-    echo -e "  ${GREEN}OLLAMA_INSTALL_URL${RESET}   Installer script to run on update"
-    echo -e "                          (default: https://ollama.com/install.sh)"
-    echo -e "  ${GREEN}OLLAMA_RELEASES_API${RESET}  Release metadata endpoint"
-    echo -e "                          (default: GitHub releases/latest)"
+    echo -e "  ${GREEN}OLLAMA_HOST${RESET}           Daemon address or Unix socket"
+    echo -e "                           (default: 127.0.0.1:11434)"
+    echo -e "  ${GREEN}OLLAMA_INSTALL_URL${RESET}    Installer script to run on update"
+    echo -e "                           (default: https://ollama.com/install.sh)"
+    echo -e "  ${GREEN}OLLAMA_RELEASES_API${RESET}   Release metadata endpoint"
+    echo -e "                           (default: GitHub releases/latest)"
+    echo -e "  ${GREEN}OLLAMA_RELEASES_PAGE${RESET}  Human-readable release page URL"
+    echo -e "  ${GREEN}OLLAMA_UPDATE_TIMEOUT${RESET} Seconds to wait for the daemon after"
+    echo -e "                           an update (default: 20)"
+    echo -e "  ${GREEN}NO_COLOR${RESET}              Disable ANSI colours"
     echo
     echo -e "${CYAN}Exit codes:${RESET}"
     echo -e "  0  Installed and running, no newer release (or update succeeded)"
     echo -e "  1  Ollama is not installed"
     echo -e "  2  Ollama is installed but not running (web check skipped)"
-    echo -e "  3  Version check failed (network or GitHub API problem)"
+    echo -e "  3  Version check failed (network, HTTP status or malformed response)"
     echo -e "  4  A newer release is available but was not installed"
     echo -e "  5  Update was attempted but failed or needs a daemon restart"
+    echo -e "  6  Missing dependency or unsupported environment"
     echo
     echo -e "${CYAN}Examples:${RESET}"
     echo -e "  Check the default local daemon:"
@@ -137,20 +194,151 @@ print_usage() {
 }
 
 # ==============================================================================
+# ENVIRONMENT AND VERSION HELPERS
+# ==============================================================================
+
+# Function: check_environment
+# Description: Verifies the Bash version, required commands and version sort.
+# Returns: 0 when usable, 1 otherwise (caller exits 6).
+check_environment() {
+    local missing=() cmd
+
+    if ((BASH_VERSINFO[0] < 4)); then
+        log_err "Bash 4 or newer is required (found $BASH_VERSION)."
+        return 1
+    fi
+
+    for cmd in "${REQUIRED_COMMANDS[@]}"; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+
+    if ((${#missing[@]} > 0)); then
+        log_err "Missing required command(s): ${missing[*]}"
+        return 1
+    fi
+
+    if [ "$(printf 'x\n' | sed 's/x/y/')" != "y" ]; then
+        log_err "'sed' is present but does not work."
+        return 1
+    fi
+
+    if [ "$(printf '1.0\n1.0.1\n' | sort -V 2>/dev/null | tail -n 1)" != "1.0.1" ]; then
+        log_err "This 'sort' does not support -V (version sort)."
+        return 1
+    fi
+
+    return 0
+}
+
+# Function: version_ge
+# Description: True when $1 is greater than or equal to $2 (sort -V ordering).
+# Arguments: $1 - left version, $2 - right version
+version_ge() {
+    local a="${1#v}" b="${2#v}" highest
+
+    a="${a//[[:space:]]/}"
+    b="${b//[[:space:]]/}"
+    [ -n "$a" ] && [ -n "$b" ] || return 1
+
+    highest="$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n 1)"
+    [ "$highest" = "$a" ]
+}
+
+# Function: version_gt
+# Description: True when $1 is strictly greater than $2.
+# Arguments: $1 - left version, $2 - right version
+version_gt() {
+    version_ge "$1" "$2" && [ "$1" != "$2" ]
+}
+
+# Function: api_version
+# Description: Queries the daemon and prints its version, or nothing.
+api_version() {
+    curl -fsS --max-time 3 \
+        "${CURL_DAEMON[@]+"${CURL_DAEMON[@]}"}" \
+        "$API_VERSION_URL" 2>/dev/null |
+        sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+        head -n 1
+}
+
+# Function: fetch_release
+# Description: Fetches the latest release and sets LATEST_VERSION.
+#              Distinguishes rate limiting, transport errors and bad payloads.
+# Returns: 0 on success, 1 otherwise.
+fetch_release() {
+    local body headers code retry
+
+    body="$(mktemp)"
+    headers="$(mktemp)"
+
+    code="$(curl -sSL --max-time 10 \
+        -D "$headers" -o "$body" -w '%{http_code}' \
+        -H 'Accept: application/vnd.github+json' \
+        -H "User-Agent: check_ollama.sh/${SCRIPT_VERSION}" \
+        "$RELEASES_API" 2>/dev/null || true)"
+    [ -n "$code" ] || code="000"
+
+    # Transports without HTTP status (file:// mirrors) still return a body.
+    if [ "$code" = "000" ] && [ -s "$body" ]; then
+        code="200"
+    fi
+
+    case "$code" in
+        200)
+            LATEST_VERSION="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' "$body" | head -n 1)"
+            rm -f "$body" "$headers"
+            if [ -z "$LATEST_VERSION" ]; then
+                log_err "The release response from $RELEASES_API was malformed."
+                return 1
+            fi
+            return 0
+            ;;
+        403 | 429)
+            retry="$(sed -n 's/^[Rr]etry-[Aa]fter:[[:space:]]*//p' "$headers" | tr -d '\r' | head -n 1)"
+            rm -f "$body" "$headers"
+            log_err "Release lookup denied or rate limited (HTTP $code)."
+            if [ -n "$retry" ]; then
+                log_note "Retry after ${retry}s, or use OLLAMA_RELEASES_API with a mirror."
+            else
+                log_note "Unauthenticated GitHub allows 60 requests per hour; set OLLAMA_RELEASES_API to use a mirror."
+            fi
+            return 1
+            ;;
+        000)
+            rm -f "$body" "$headers"
+            log_err "Could not reach $RELEASES_API."
+            return 1
+            ;;
+        *)
+            rm -f "$body" "$headers"
+            log_err "Unexpected HTTP status $code from $RELEASES_API."
+            return 1
+            ;;
+    esac
+}
+
+# ==============================================================================
 # UPDATE SUPPORT
 # ==============================================================================
 
 # Function: run_update
 # Description: Downloads the installer, runs it with root privileges, then
-#              polls the daemon until it reports the expected version.
+#              polls the daemon until it reports at least the expected version.
 # Arguments: $1 - version expected after the update
-# Returns: 0 when the daemon reports that version, 1 otherwise
+# Returns: 0 when the daemon reports that version or newer, 1 otherwise
 run_update() {
     local expected="$1"
     local version=""
-    local attempt
+    local timeout="${OLLAMA_UPDATE_TIMEOUT:-20}"
     local installer_status=0
+    local size=""
+    local deadline
     local -a runner=()
+
+    if ! [[ "$timeout" =~ ^[0-9]+$ ]] || ((timeout < 1)); then
+        log_warn "Invalid OLLAMA_UPDATE_TIMEOUT='$timeout'; using 20 seconds."
+        timeout=20
+    fi
 
     if [ "$(id -u)" -ne 0 ]; then
         if command -v sudo >/dev/null 2>&1; then
@@ -167,6 +355,20 @@ run_update() {
         return 1
     fi
 
+    size="$(wc -c <"$TMP_INSTALLER" | tr -d '[:space:]')"
+    if [ "$size" = "0" ]; then
+        log_err "The downloaded installer is empty; nothing was executed."
+        return 1
+    fi
+    if head -c 512 "$TMP_INSTALLER" | grep -qiE '<!doctype[[:space:]]+html|<html'; then
+        log_err "The downloaded file looks like an HTML page, not a shell script."
+        return 1
+    fi
+
+    if $HAVE_SHA256; then
+        log_note "Installer SHA-256: $(sha256sum "$TMP_INSTALLER" | cut -d' ' -f 1)"
+    fi
+
     log_note "Running the installer (this may take a while) ..."
     "${runner[@]}" sh "$TMP_INSTALLER" || installer_status=$?
 
@@ -174,23 +376,34 @@ run_update() {
     # post-install step (the GPU/CUDA block aborts on Arch-family systems where
     # /etc/os-release has no VERSION_ID) after the binary is already in place.
     # Always verify the daemon before trusting the installer's exit code.
-    for attempt in 1 2 3 4 5; do
+    deadline=$((SECONDS + timeout))
+    while ((SECONDS < deadline)); do
+        version="$(api_version || true)"
+        version_ge "$version" "$expected" && break
         sleep 1
-        version="$(curl -fsS --max-time 3 "$API_VERSION_URL" 2>/dev/null |
-            sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 || true)"
-        [ "$version" = "$expected" ] && break
     done
 
-    if [ "$version" = "$expected" ]; then
-        if [ "$installer_status" -ne 0 ]; then
+    if version_ge "$version" "$expected"; then
+        if ((installer_status != 0)); then
             log_warn "Installer exited with status $installer_status (an optional post-install step failed); the daemon already reports v$version."
         fi
         log_info "Update complete; the daemon now reports v$version."
+        if $QUIET; then
+            printf '%bUpdated Ollama to v%s.%b\n' "$GREEN" "$version" "$RESET"
+        fi
         return 0
     fi
 
-    log_err "Installer exited with status $installer_status; the daemon still reports '${version:-unknown}'."
-    log_note "Restart it manually: sudo systemctl restart ollama (or restart 'ollama serve')."
+    if ((installer_status != 0)); then
+        log_err "Installer exited with status $installer_status; the daemon still reports '${version:-unknown}'."
+    else
+        log_err "Installer reported success but the daemon still reports '${version:-unknown}'."
+    fi
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        log_note "Restart it manually: sudo systemctl restart ollama"
+    else
+        log_note "Restart the Ollama service (for example, restart 'ollama serve')."
+    fi
     return 1
 }
 
@@ -221,6 +434,11 @@ while [[ $# -gt 0 ]]; do
             ;;
         --)
             shift
+            if (($# > 0)); then
+                log_err "Unexpected argument: $1"
+                echo
+                print_usage 1
+            fi
             break
             ;;
         -*)
@@ -238,6 +456,16 @@ done
 
 print_banner
 
+if ! check_environment; then
+    exit 6
+fi
+
+if command -v pgrep >/dev/null 2>&1; then HAVE_PGREP=true; fi
+if command -v sha256sum >/dev/null 2>&1; then HAVE_SHA256=true; fi
+
+# Prompting must never depend on stdout: open the controlling terminal.
+if { exec 3>/dev/tty; } 2>/dev/null; then TTY_AVAILABLE=true; fi
+
 # ---- Phase 1: is Ollama installed? ----
 log_info "Phase 1/4: checking whether Ollama is installed ..."
 OLLAMA_BIN="$(command -v ollama || true)"
@@ -251,7 +479,9 @@ log_info "Ollama found at $OLLAMA_BIN"
 log_info "Phase 2/4: checking whether the Ollama daemon is running ..."
 RUNNING=false
 API_VERSION=""
-API_RESPONSE="$(curl -fsS --max-time 5 "$API_VERSION_URL" 2>/dev/null || true)"
+API_RESPONSE="$(curl -fsS --max-time 5 \
+    "${CURL_DAEMON[@]+"${CURL_DAEMON[@]}"}" \
+    "$API_VERSION_URL" 2>/dev/null || true)"
 if [ -n "$API_RESPONSE" ]; then
     API_VERSION="$(printf '%s' "$API_RESPONSE" |
         sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
@@ -260,7 +490,7 @@ fi
 
 # Fall back to the process table: a daemon may be up while the API is not
 # reachable from here (different bind address, firewall, permission, ...).
-if ! $RUNNING && pgrep -x ollama >/dev/null 2>&1; then
+if ! $RUNNING && $HAVE_PGREP && pgrep -x ollama >/dev/null 2>&1; then
     RUNNING=true
     log_warn "Daemon process is running but $API_VERSION_URL did not answer."
 fi
@@ -277,7 +507,7 @@ log_info "Phase 3/4: resolving the local version ..."
 LOCAL_VERSION="$API_VERSION"
 if [ -z "$LOCAL_VERSION" ]; then
     LOCAL_VERSION="$(ollama --version 2>/dev/null |
-        sed -n 's/.*version is[[:space:]]*//p' | head -n 1)"
+        sed -n 's/.*version is[[:space:]]*//p' | head -n 1 || true)"
 fi
 if [ -z "$LOCAL_VERSION" ]; then
     LOCAL_VERSION="$(ollama --version 2>/dev/null |
@@ -294,17 +524,8 @@ fi
 
 # ---- Phase 4: fetch the latest upstream release ----
 log_info "Phase 4/4: fetching the latest release from GitHub ..."
-RELEASE_JSON="$(curl -fsSL --max-time 10 \
-    -H 'Accept: application/vnd.github+json' \
-    -H "User-Agent: check_ollama.sh/${SCRIPT_VERSION}" \
-    "$RELEASES_API" 2>/dev/null || true)"
-
-LATEST_VERSION="$(printf '%s' "$RELEASE_JSON" |
-    sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' | head -n 1)"
-
-if [ -z "$LATEST_VERSION" ]; then
-    log_warn "Could not reach GitHub or parse the latest release; version check skipped."
-    log_note "Browse the releases manually: $RELEASES_PAGE"
+if ! fetch_release; then
+    log_note "Release page: $RELEASES_PAGE"
     exit 3
 fi
 
@@ -313,42 +534,47 @@ if [ -z "$LOCAL_VERSION" ]; then
     exit 0
 fi
 
-if [ "$LOCAL_VERSION" = "$LATEST_VERSION" ]; then
+if version_gt "$LATEST_VERSION" "$LOCAL_VERSION"; then
+    log_warn "Update available: installed v$LOCAL_VERSION, latest v$LATEST_VERSION."
+    log_note "Release page: $RELEASES_PAGE"
+elif version_gt "$LOCAL_VERSION" "$LATEST_VERSION"; then
+    log_note "Installed v$LOCAL_VERSION is newer than the latest release (v$LATEST_VERSION)."
+    $QUIET || printf '%bDone.%b Nothing to update.\n' "$GREEN" "$RESET"
+    exit 0
+else
     log_info "Ollama is up to date (v$LOCAL_VERSION)."
     $QUIET || printf '%bDone.%b No newer release found.\n' "$GREEN" "$RESET"
     exit 0
 fi
-
-# sort -V orders dotted versions correctly (0.40.9 < 0.40.18).
-HIGHEST="$(printf '%s\n%s\n' "$LOCAL_VERSION" "$LATEST_VERSION" | sort -V | tail -n 1)"
-if [ "$HIGHEST" != "$LATEST_VERSION" ]; then
-    log_note "Installed v$LOCAL_VERSION is newer than the latest release (v$LATEST_VERSION)."
-    $QUIET || printf '%bDone.%b Nothing to update.\n' "$GREEN" "$RESET"
-    exit 0
-fi
-
-log_warn "Update available: installed v$LOCAL_VERSION, latest v$LATEST_VERSION."
-log_note "Release page: $RELEASES_PAGE"
 
 # Report-only when explicitly disabled or when there is no terminal to answer
 # a prompt (cron, pipes, CI): never block an unattended run.
 if [ "$UPDATE_MODE" = "no" ]; then
     exit 4
 fi
-if [ "$UPDATE_MODE" = "ask" ] && [ ! -t 0 ]; then
-    log_note "Not a terminal; use -y to update automatically."
+
+if ! $DAEMON_IS_LOCAL; then
+    log_warn "OLLAMA_HOST points to a remote daemon ($DAEMON_HOST); refusing to update this machine."
+    log_note "Run the update on the host that runs the daemon, or update it manually."
     exit 4
 fi
 
 if [ "$UPDATE_MODE" = "ask" ]; then
-    printf '%b[NOTE]%b Update commands:\n' "$CYAN" "$RESET"
-    printf '       curl -fsSL %s -o <temp file>\n' "$INSTALL_URL"
-    printf '       sudo sh <temp file>\n'
-    printf 'Update now? [y/N] '
+    if ! $TTY_AVAILABLE; then
+        log_note "No terminal available; use -y to update automatically."
+        exit 4
+    fi
+    if ! $QUIET; then
+        printf '%b[NOTE]%b Update commands:\n' "$CYAN" "$RESET" >&3
+        printf '       curl -fsSL %s -o <temp file>\n' "$INSTALL_URL" >&3
+        printf '       sudo sh <temp file>\n' >&3
+    fi
+    printf 'Update now? [y/N] ' >&3
     REPLY=""
-    read -r REPLY || true
+    read -r REPLY </dev/tty || true
+    REPLY="$(printf '%s' "$REPLY" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
     case "$REPLY" in
-        y | Y | yes | YES) ;;
+        y | yes) ;;
         *)
             log_note "Update skipped."
             exit 4
@@ -360,7 +586,6 @@ TMP_INSTALLER="$(mktemp)"
 trap 'rm -f "${TMP_INSTALLER:-}"' EXIT
 
 if run_update "$LATEST_VERSION"; then
-    $QUIET || printf '%bDone.%b Ollama updated to v%s.\n' "$GREEN" "$RESET" "$LATEST_VERSION"
     exit 0
 fi
 exit 5
