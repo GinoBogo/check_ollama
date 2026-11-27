@@ -93,6 +93,7 @@ INSTALL_URL="${OLLAMA_INSTALL_URL:-https://ollama.com/install.sh}"
 QUIET=false
 UPDATE_MODE="ask" # ask | yes | no
 TMP_INSTALLER=""
+FRESH_INSTALL=false
 
 # Capability flags, resolved by check_environment().
 HAVE_PGREP=false
@@ -557,6 +558,7 @@ if [ -z "$OLLAMA_BIN" ]; then
         log_note "Open a new shell or check /usr/local/bin/ollama."
         exit 5
     fi
+    FRESH_INSTALL=true
 fi
 log_info "Ollama found at $OLLAMA_BIN"
 
@@ -624,11 +626,19 @@ if version_gt "$LATEST_VERSION" "$LOCAL_VERSION"; then
     log_note "Release page: $RELEASES_PAGE"
 elif version_gt "$LOCAL_VERSION" "$LATEST_VERSION"; then
     log_note "Installed v$LOCAL_VERSION is newer than the latest release (v$LATEST_VERSION)."
-    $QUIET || printf '%bDone.%b Nothing to update.\n' "$GREEN" "$RESET"
+    if $FRESH_INSTALL; then
+        $QUIET || printf '%bDone.%b Ollama is installed and up to date.\n' "$GREEN" "$RESET"
+    else
+        $QUIET || printf '%bDone.%b Nothing to update.\n' "$GREEN" "$RESET"
+    fi
     exit 0
 else
     log_info "Ollama is up to date (v$LOCAL_VERSION)."
-    $QUIET || printf '%bDone.%b No newer release found.\n' "$GREEN" "$RESET"
+    if $FRESH_INSTALL; then
+        $QUIET || printf '%bDone.%b Ollama is installed and up to date.\n' "$GREEN" "$RESET"
+    else
+        $QUIET || printf '%bDone.%b No newer release found.\n' "$GREEN" "$RESET"
+    fi
     exit 0
 fi
 

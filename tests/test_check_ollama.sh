@@ -447,6 +447,8 @@ ran_code "fresh install with -y succeeds" 0 \
         "$BASH" "$SUT" -y
 says "fresh install completes" "Installation complete; the daemon now reports v9.9.9"
 says "post-install check runs" "Ollama is up to date (v9.9.9)"
+says "fresh install final message is contextual" "Done. Ollama is installed and up to date."
+says_not "fresh install avoids stale message" "No newer release found."
 rm -f "$INSTALLBIN/ollama"
 
 set_versions 0.0.1 9.9.9
